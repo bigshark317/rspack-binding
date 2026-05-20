@@ -1,13 +1,11 @@
-name: Build Binding Package
+name: Build Binding Artifacts
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "binding-v*"
 
 jobs:
   build:
+    name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +28,6 @@ jobs:
             runner: '["macos-13"]'
           - target: aarch64-apple-darwin
             runner: '["macos-14"]'
-
     uses: ./.github/workflows/reusable-build.yml
     with:
       target: ${{ matrix.target }}
@@ -38,11 +35,10 @@ jobs:
       profile: release-prod
       test: false
 
-  package:
-    name: Assemble Single Package
+  assemble:
+    name: Assemble Binding Package
     runs-on: ubuntu-latest
     needs: build
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,67 +69,41 @@ jobs:
             cp crates/node_binding/README.md dist-binding/README.md
           else
             cat > dist-binding/README.md <<'EOF'
-          # @byted-meego/rspack-binding
+          # Binding artifacts
 
-          Prebuilt native bindings for rspack.
+          Aggregated multi-platform native bindings built from GitHub Actions.
           EOF
           fi
 
           find artifacts -name '*.node' -exec cp {} dist-binding/ \;
 
           node <<'NODE'
-          const fs = require('fs');
+          const fs = require("node:fs");
 
-          const src = JSON.parse(
-            fs.readFileSync('crates/node_binding/package.json', 'utf8')
+          const sourcePkg = JSON.parse(
+            fs.readFileSync("crates/node_binding/package.json", "utf8")
           );
 
-          const pkg = {
-            name: '@byted-meego/rspack-binding',
-            version: src.version,
-            license: src.license,
-            description: src.description,
-            main: 'binding.js',
-            types: 'binding.d.ts',
-            homepage: src.homepage,
-            bugs: src.bugs,
-            repository: {
-              type: 'git',
-              url: 'git+https://github.com/bigshark317/rspack-binding.git'
-            },
-            publishConfig: {
-              access: 'public'
-            },
-            files: [
-              'binding.js',
-              'binding.d.ts',
-              '*.node',
-              'README.md',
-              'LICENSE'
-            ]
-          };
+          delete sourcePkg.optionalDependencies;
+
+          sourcePkg.files = [
+            "binding.js",
+            "binding.d.ts",
+            "*.node",
+            "README.md",
+            "LICENSE"
+          ];
 
           fs.writeFileSync(
-            'dist-binding/package.json',
-            JSON.stringify(pkg, null, 2)
+            "dist-binding/package.json",
+            `${JSON.stringify(sourcePkg, null, 2)}\n`
           );
           NODE
 
           ls -lah dist-binding
 
-      - name: Pack npm tarball
-        run: |
-          cd dist-binding
-          npm pack
-
-      - name: Upload assembled package
+      - name: Upload assembled binding package
         uses: actions/upload-artifact@v4
         with:
           name: rspack-binding-package
           path: dist-binding
-
-      - name: Upload npm tarball
-        uses: actions/upload-artifact@v4
-        with:
-          name: rspack-binding-tgz
-          path: dist-binding/*.tgz
