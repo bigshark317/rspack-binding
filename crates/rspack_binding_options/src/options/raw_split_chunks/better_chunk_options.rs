@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use napi::Either;
 use napi_derive::napi;
 use rspack_core::ChunkGroupOrderKey;
-use rspack_plugin_split_chunks::{BetterChunkOptions, BetterChunkStage, SplitChunkSizes};
+use rspack_plugin_split_chunks::{BetterChunkOptions, BetterChunkStage};
 
 #[derive(Debug)]
 #[napi(object, object_to_js = false)]
@@ -21,6 +21,7 @@ pub struct RawBetterChunkOptions {
   pub keep_named_cache_group: Option<bool>,
   pub keep_named_chunk: Option<bool>,
   pub remove_duplicate_modules: Option<bool>,
+  pub entry_like_chunks: Option<Vec<String>>,
   pub stages: Option<Vec<RawStage>>,
   pub keep_magic_chunks: Option<Vec<String>>,
   pub concat_small_chunks: Option<bool>,
@@ -90,6 +91,7 @@ impl From<RawBetterChunkOptions> for BetterChunkOptions {
       }),
       remove_duplicate_modules: options.remove_duplicate_modules.unwrap_or(false),
       skip_concat_chunks: options.skip_concat_chunks.unwrap_or(vec![]),
+      entry_like_chunks: options.entry_like_chunks.unwrap_or(vec![]),
       concat_small_chunks: options.concat_small_chunks.unwrap_or(false),
       concat_unrelated_chunks: options.concat_unrelated_chunks.unwrap_or(false),
       split_big_chunks: options.split_big_chunks.unwrap_or(false),

@@ -7,9 +7,7 @@ use std::sync::{Arc, LazyLock};
 
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use regex::Regex;
-use rspack_collections::{
-  Identifiable, Identifier, IdentifierDashSet, IdentifierMap, IdentifierSet, UkeyMap, UkeySet,
-};
+use rspack_collections::{Identifiable, IdentifierMap, IdentifierSet, UkeyMap, UkeySet};
 use rspack_core::incremental::Mutation;
 use rspack_core::{
   compare_chunks_with_graph, compare_modules_by_identifier, merge_runtime, Chunk,
@@ -75,7 +73,13 @@ pub struct BetterChunkOptions {
   pub concat_unrelated_chunks: bool,
   pub concat_chunk_sizes: Option<(u32, u32)>,
   pub split_big_chunks: bool,
+  pub entry_like_chunks: Vec<String>,
   pub split_chunk_sizes: Option<(u32, u32)>,
+}
+
+struct EntryLikeChunkInfo {
+  groups: UkeySet<ChunkGroupUkey>,
+  modules: IdentifierSet,
 }
 
 #[derive(Debug, Clone)]
@@ -1573,6 +1577,135 @@ impl ChunkMutation {
       }
     });
   }
+
+  fn remove_chunk_from_groups(
+    compilation: &mut Compilation,
+    chunk_key: ChunkUkey,
+    groups: &UkeySet<ChunkGroupUkey>,
+  ) -> Option<()> {
+    let groups_to_remove = {
+      let chunk = compilation.chunk_by_ukey.get(&chunk_key)?;
+      chunk
+        .groups()
+        .iter()
+        .filter(|group| groups.contains(group))
+        .cloned()
+        .collect::<Vec<_>>()
+    };
+
+    groups_to_remove.into_iter().for_each(|group_key| {
+      if let Some(group) = compilation.chunk_group_by_ukey.get_mut(&group_key) {
+        group.remove_chunk(&chunk_key);
+      }
+      if let Some(chunk) = compilation.chunk_by_ukey.get_mut(&chunk_key) {
+        chunk.remove_group(&group_key);
+      }
+    });
+
+    Some(())
+  }
+
+  fn split_entry_like_chunks(
+    &mut self,
+    compilation: &mut Compilation,
+    entry_like_groups: &UkeySet<ChunkGroupUkey>,
+    entry_like_modules: &IdentifierSet,
+  ) -> Option<()> {
+    if entry_like_groups.is_empty() || entry_like_modules.is_empty() {
+      return Some(());
+    }
+
+    let entry_like_chunks = pick_chunks_from_groups(compilation, entry_like_groups);
+
+    entry_like_chunks.into_iter().for_each(|chunk_key| {
+      let Some(chunk) = compilation.chunk_by_ukey.get(&chunk_key) else {
+        return;
+      };
+      if chunk.has_runtime(&compilation.chunk_group_by_ukey)
+        || compilation
+          .chunk_graph
+          .get_number_of_entry_modules(&chunk_key)
+          > 0
+      {
+        return;
+      }
+      let has_non_entry_like_group = chunk
+        .groups()
+        .iter()
+        .any(|group| !entry_like_groups.contains(group));
+
+      let chunk_modules = compilation
+        .chunk_graph
+        .get_chunk_modules_identifier(&chunk_key)
+        .clone();
+      if chunk_modules.is_empty() {
+        return;
+      }
+
+      let startup_modules = chunk_modules
+        .iter()
+        .filter(|module| entry_like_modules.contains(module))
+        .cloned()
+        .collect::<IdentifierSet>();
+
+      if startup_modules.len() == chunk_modules.len() {
+        return;
+      }
+      if !has_non_entry_like_group {
+        return;
+      }
+
+      if startup_modules.is_empty() {
+        Self::remove_chunk_from_groups(compilation, chunk_key, entry_like_groups);
+        return;
+      }
+
+      let async_modules = chunk_modules
+        .iter()
+        .filter(|module| !startup_modules.contains(module))
+        .cloned()
+        .collect::<IdentifierSet>();
+      let new_chunk_key = self.new_chunk(compilation);
+
+      {
+        let [origin, new] = compilation
+          .chunk_by_ukey
+          .get_many_mut([&chunk_key, &new_chunk_key])
+          .expect("[split_entry_like_chunks] split chunks not found in compilation");
+        origin.split(new, &mut compilation.chunk_group_by_ukey);
+        *new.chunk_reason_mut() = Some(String::from(
+          "BetterChunk split from entry-like startup modules",
+        ));
+      }
+
+      Self::remove_chunk_from_groups(compilation, new_chunk_key, entry_like_groups);
+
+      async_modules.iter().for_each(|module_id| {
+        compilation
+          .chunk_graph
+          .connect_chunk_and_module(new_chunk_key, *module_id);
+        compilation
+          .chunk_graph
+          .disconnect_chunk_and_module(&chunk_key, *module_id);
+      });
+
+      if let Some(origin) = self.chunks.get_mut(&chunk_key) {
+        origin.modules = startup_modules;
+      }
+      if let Some(new_chunk) = self.chunks.get_mut(&new_chunk_key) {
+        new_chunk.modules = async_modules;
+      }
+
+      if let Some(mutations) = compilation.incremental.mutations_write() {
+        mutations.add(Mutation::ChunkSplit {
+          from: chunk_key,
+          to: new_chunk_key,
+        });
+      }
+    });
+
+    Some(())
+  }
 }
 
 fn pick_shared_module_chunk(
@@ -1820,9 +1953,11 @@ pub(crate) fn pick_stage_modules(
       if shared.len() > 0 {
         if strict {
           let smc_keys = shared_module_chunks.keys().collect::<Vec<_>>();
-          assert!(shared.iter().all(|shared_path| smc_keys
-            .iter()
-            .any(|full_path| full_path.contains(shared_path))));
+          assert!(shared.iter().all(|shared_path| {
+            smc_keys
+              .iter()
+              .any(|full_path| full_path.contains(shared_path))
+          }));
         }
         shared_module_chunks
           .keys()
@@ -1883,6 +2018,84 @@ pub(crate) fn pick_stage_modules(
   stages
 }
 
+fn pick_chunks_from_groups(
+  compilation: &Compilation,
+  groups: &UkeySet<ChunkGroupUkey>,
+) -> UkeySet<ChunkUkey> {
+  groups
+    .iter()
+    .filter_map(|group_key| compilation.chunk_group_by_ukey.get(group_key))
+    .flat_map(|group| group.chunks.iter().cloned())
+    .collect::<UkeySet<ChunkUkey>>()
+}
+
+fn collect_sync_dependencies(compilation: &Compilation, roots: IdentifierSet) -> IdentifierSet {
+  let mg = compilation.get_module_graph();
+  let mut modules = IdentifierSet::default();
+  let mut queue = roots.into_iter().collect::<Vec<_>>();
+
+  while let Some(module_id) = queue.pop() {
+    if !modules.insert(module_id) {
+      continue;
+    }
+
+    let Some(module) = mg.module_by_identifier(&module_id) else {
+      continue;
+    };
+
+    module.get_dependencies().iter().for_each(|dependency_id| {
+      if let Some(dep_module_id) = mg.module_identifier_by_dependency_id(dependency_id) {
+        queue.push(*dep_module_id);
+      }
+    });
+  }
+
+  modules
+}
+
+fn pick_entry_like_chunks(compilation: &Compilation, names: &[String]) -> EntryLikeChunkInfo {
+  let mut groups = names
+    .iter()
+    .flat_map(|name| {
+      compilation
+        .named_chunk_groups
+        .iter()
+        .filter(move |(group_name, _)| group_name.contains(name))
+        .map(|(_, group_key)| *group_key)
+    })
+    .collect::<UkeySet<ChunkGroupUkey>>();
+
+  names.iter().for_each(|name| {
+    compilation
+      .named_chunks
+      .iter()
+      .filter(|(chunk_name, _)| chunk_name.contains(name))
+      .for_each(|(_, chunk_key)| {
+        if let Some(chunk) = compilation.chunk_by_ukey.get(chunk_key) {
+          groups.extend(chunk.groups().iter().cloned());
+        }
+      });
+  });
+
+  let mut roots = IdentifierSet::default();
+  pick_chunks_from_groups(compilation, &groups)
+    .iter()
+    .for_each(|chunk| {
+      roots.extend(
+        compilation
+          .chunk_graph
+          .get_chunk_entry_modules(chunk)
+          .iter()
+          .cloned(),
+      );
+    });
+
+  EntryLikeChunkInfo {
+    groups,
+    modules: collect_sync_dependencies(compilation, roots),
+  }
+}
+
 impl SplitChunksPlugin {
   pub(in crate::plugin) fn better_chunks(
     &self,
@@ -1893,7 +2106,6 @@ impl SplitChunksPlugin {
     options: &BetterChunkOptions,
   ) {
     let logger = compilation.get_logger(self.name());
-    let compilation_ref = &*compilation;
 
     let mut chunk_mutation = ChunkMutation::create(compilation, delimiter, Default::default());
 
@@ -1902,22 +2114,30 @@ impl SplitChunksPlugin {
     }
 
     keep_chunks.retain(|chunk| {
-      compilation_ref
+      compilation
         .chunk_by_ukey
         .get(chunk)
         .map_or(false, |chunk| chunk.name().is_some())
     });
 
     if options.keep_named_chunk {
-      compilation_ref
-        .named_chunks
-        .iter()
-        .for_each(|(name, chunk)| {
-          keep_chunks.insert(*chunk);
-        });
+      compilation.named_chunks.iter().for_each(|(name, chunk)| {
+        keep_chunks.insert(*chunk);
+      });
     }
 
     let start = logger.time("make better_chunks");
+
+    let entry_like_info = pick_entry_like_chunks(compilation, &options.entry_like_chunks);
+    chunk_mutation.split_entry_like_chunks(
+      compilation,
+      &entry_like_info.groups,
+      &entry_like_info.modules,
+    );
+    let entry_like_chunks = pick_chunks_from_groups(compilation, &entry_like_info.groups);
+    chunk_mutation
+      .entry_chunks
+      .extend(entry_like_chunks.iter().cloned());
 
     let shared_module_chunk_map = pick_shared_module_chunk(compilation);
     let strict = options.strict;
@@ -1969,6 +2189,7 @@ impl SplitChunksPlugin {
       ));
     }
 
+    let compilation_ref = &*compilation;
     let split_group_point = split_group_point
       .iter()
       .filter_map(|end_point| {
@@ -1993,6 +2214,13 @@ impl SplitChunksPlugin {
         .duplicate_module_chunk
         .values_mut()
         .for_each(|chunk| {
+          if chunk.iter().any(|chunk| entry_like_chunks.contains(chunk)) {
+            // Entry-like chunks are the canonical owner for their duplicate modules.
+            // Keep the other chunks in this set so remove_duplicate_modules can remove
+            // those duplicates from later vendor/business chunks even when they are
+            // named cache-group chunks.
+            return;
+          }
           chunk.retain(|chunk| !keep_chunks.contains(chunk));
         });
 

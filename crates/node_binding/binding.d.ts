@@ -1155,6 +1155,23 @@ export interface RawBannerPluginOptions {
   exclude?: string | RegExp | (string | RegExp)[]
 }
 
+export interface RawBetterChunkOptions {
+  strict?: boolean
+  log?: boolean
+  keepNamedCacheGroup?: boolean
+  keepNamedChunk?: boolean
+  removeDuplicateModules?: boolean
+  entryLikeChunks?: Array<string>
+  stages?: Array<RawStage>
+  keepMagicChunks?: Array<string>
+  concatSmallChunks?: boolean
+  concatUnrelatedChunks?: boolean
+  skipConcatChunks?: Array<string>
+  splitBigChunks?: boolean
+  splitChunkSizes?: Array<number>
+  concatChunkSizes?: Array<number>
+}
+
 export interface RawBundlerInfoPluginOptions {
   version: string
   bundler: string
@@ -1992,6 +2009,13 @@ export interface RawSplitChunksOptions {
   maxSize?: number | RawSplitChunkSizes
   maxAsyncSize?: number | RawSplitChunkSizes
   maxInitialSize?: number | RawSplitChunkSizes
+  betterChunk?: RawBetterChunkOptions
+}
+
+export interface RawStage {
+  shared?: Array<string>
+  entries?: Record<string, string | undefined | null> | Array<string>
+  modules?: Array<string>
 }
 
 export interface RawStatsOptions {
