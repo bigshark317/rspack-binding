@@ -35,6 +35,48 @@ fn request_to_id(req: &str) -> String {
   res
 }
 
+fn package_name_from_node_modules(rest: &str) -> String {
+  let mut parts = rest.split('/');
+  let first = parts.next().unwrap_or_default();
+  if first.starts_with('@') {
+    let second = parts.next().unwrap_or_default();
+    if second.is_empty() {
+      first.to_string()
+    } else {
+      format!("{first}/{second}")
+    }
+  } else {
+    first.to_string()
+  }
+}
+
+fn duplicate_group_package_key(request: &str) -> String {
+  let normalized = request.replace('\\', "/");
+
+  if let Some(idx) = normalized.rfind("/node_modules/") {
+    let rest = &normalized[idx + "/node_modules/".len()..];
+    if let Some(pnpm_idx) = rest.find("/node_modules/") {
+      let nested = &rest[pnpm_idx + "/node_modules/".len()..];
+      return format!("npm:{}", package_name_from_node_modules(nested));
+    }
+    return format!("npm:{}", package_name_from_node_modules(rest));
+  }
+
+  if let Some(idx) = normalized.find("/packages/") {
+    let rest = &normalized[idx + "/packages/".len()..];
+    let package = rest.split('/').next().unwrap_or_default();
+    return format!("workspace:packages/{package}");
+  }
+
+  if let Some(idx) = normalized.find("/core-workspace/") {
+    let rest = &normalized[idx + "/core-workspace/".len()..];
+    let package = rest.split('/').next().unwrap_or_default();
+    return format!("workspace:core-workspace/{package}");
+  }
+
+  format!("module:{normalized}")
+}
+
 fn hash_filename(filename: &str, options: &CompilerOptions) -> String {
   let mut filename_hash = RspackHash::from(&options.output);
   filename.hash(&mut filename_hash);
@@ -74,6 +116,8 @@ pub struct BetterChunkOptions {
   pub concat_chunk_sizes: Option<(u32, u32)>,
   pub split_big_chunks: bool,
   pub entry_like_chunks: Vec<String>,
+  pub strict_duplicate_chunk_grouping: bool,
+  pub split_duplicate_groups_by_package: bool,
   pub split_chunk_sizes: Option<(u32, u32)>,
 }
 
@@ -766,6 +810,8 @@ impl ChunkMutation {
     &mut self,
     compilation: &mut Compilation,
     stage_module_chunks: &Vec<IdentifierSet>,
+    strict_duplicate_chunk_grouping: bool,
+    split_duplicate_groups_by_package: bool,
   ) -> Option<()> {
     let mut move_module_to_entry_chunk: IdentifierMap<UkeySet<ChunkUkey>> = Default::default();
     let mut duplicate_modules: IdentifierSet = Default::default();
@@ -823,60 +869,101 @@ impl ChunkMutation {
       }
     });
 
-    let mut groups: Vec<IdentifierSet> = Vec::new();
-    let mut visited_modules: IdentifierSet = Default::default();
-
-    // 计算重复module所在的chunk与其他chunk中重复module的个数，重合率高的部分放到同一个组中
-    for module_a in &duplicate_modules {
-      let chunks_a = self.duplicate_module_chunk.get(module_a)?;
-      // 如果 module 已经被分组，跳过
-      if visited_modules.contains(module_a) {
-        continue;
+    let groups: Vec<IdentifierSet> = if strict_duplicate_chunk_grouping {
+      let mut groups_by_chunks: HashMap<Vec<ChunkUkey>, IdentifierSet> = Default::default();
+      for module_id in &duplicate_modules {
+        let chunks = self.duplicate_module_chunk.get(module_id)?;
+        let mut chunk_keys = chunks.iter().cloned().collect::<Vec<_>>();
+        chunk_keys.sort();
+        groups_by_chunks
+          .entry(chunk_keys)
+          .or_default()
+          .insert(module_id.clone());
       }
-      // 初始化一个新组
-      let mut group: IdentifierSet = Default::default();
-      group.insert(module_a.clone());
-      visited_modules.insert(module_a.clone());
+      groups_by_chunks.into_values().collect()
+    } else {
+      let mut groups: Vec<IdentifierSet> = Vec::new();
+      let mut visited_modules: IdentifierSet = Default::default();
 
-      let mut candidates: Vec<(ModuleIdentifier, usize)> = Vec::new();
-
-      for module_b in &duplicate_modules {
-        let chunks_b = self.duplicate_module_chunk.get(module_b)?;
-        // 跳过已处理的模块
-        if visited_modules.contains(module_b) || module_a == module_b {
+      // 计算重复module所在的chunk与其他chunk中重复module的个数，重合率高的部分放到同一个组中
+      for module_a in &duplicate_modules {
+        let chunks_a = self.duplicate_module_chunk.get(module_a)?;
+        // 如果 module 已经被分组，跳过
+        if visited_modules.contains(module_a) {
           continue;
         }
+        // 初始化一个新组
+        let mut group: IdentifierSet = Default::default();
+        group.insert(module_a.clone());
+        visited_modules.insert(module_a.clone());
 
-        // 计算两个模块的 chunk 集合的交集
-        let intersection = chunks_a
-          .intersection(chunks_b)
-          .cloned()
-          .collect::<UkeySet<ChunkUkey>>();
-        let intersection_len = intersection.len();
-        let half_chunks_a = chunks_a.len() / 2;
-        let half_chunks_b = chunks_b.len() / 2;
+        let mut candidates: Vec<(ModuleIdentifier, usize)> = Vec::new();
 
-        // 检查是否满足阈值条件
-        if intersection_len > half_chunks_a
-          || intersection_len > half_chunks_b
-          || intersection_len > 10
-        {
-          candidates.push((module_b.clone(), intersection_len));
+        for module_b in &duplicate_modules {
+          let chunks_b = self.duplicate_module_chunk.get(module_b)?;
+          // 跳过已处理的模块
+          if visited_modules.contains(module_b) || module_a == module_b {
+            continue;
+          }
+
+          // 计算两个模块的 chunk 集合的交集
+          let intersection = chunks_a
+            .intersection(chunks_b)
+            .cloned()
+            .collect::<UkeySet<ChunkUkey>>();
+          let intersection_len = intersection.len();
+          let half_chunks_a = chunks_a.len() / 2;
+          let half_chunks_b = chunks_b.len() / 2;
+
+          // 检查是否满足阈值条件
+          if intersection_len > half_chunks_a
+            || intersection_len > half_chunks_b
+            || intersection_len > 10
+          {
+            candidates.push((module_b.clone(), intersection_len));
+          }
         }
+
+        // 按重合度从高到低排序
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // 合并重合度最高的模块
+        for (module_b, _) in candidates {
+          group.insert(module_b.clone());
+          visited_modules.insert(module_b.clone());
+        }
+
+        // 将完成的组加入到结果中
+        groups.push(group);
       }
+      groups
+    };
 
-      // 按重合度从高到低排序
-      candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    let groups: Vec<IdentifierSet> = if split_duplicate_groups_by_package {
+      groups
+        .into_iter()
+        .flat_map(|group| {
+          let mut package_groups: HashMap<String, IdentifierSet> = Default::default();
+          group.into_iter().for_each(|module_id| {
+            let key = compilation
+              .module_by_identifier(&module_id)
+              .and_then(|module| module.name_for_condition())
+              .map(|request| duplicate_group_package_key(&request))
+              .unwrap_or_else(|| format!("module:{module_id}"));
+            package_groups.entry(key).or_default().insert(module_id);
+          });
 
-      // 合并重合度最高的模块
-      for (module_b, _) in candidates {
-        group.insert(module_b.clone());
-        visited_modules.insert(module_b.clone());
-      }
-
-      // 将完成的组加入到结果中
-      groups.push(group);
-    }
+          let mut package_groups = package_groups.into_iter().collect::<Vec<_>>();
+          package_groups.sort_by(|a, b| a.0.cmp(&b.0));
+          package_groups
+            .into_iter()
+            .map(|(_, modules)| modules)
+            .collect::<Vec<_>>()
+        })
+        .collect()
+    } else {
+      groups
+    };
 
     // 每个组创建新chunk
     groups.iter().for_each(|group| {
@@ -2224,7 +2311,12 @@ impl SplitChunksPlugin {
           chunk.retain(|chunk| !keep_chunks.contains(chunk));
         });
 
-      chunk_mutation.remove_duplicate_modules(compilation, &stage_modules);
+      chunk_mutation.remove_duplicate_modules(
+        compilation,
+        &stage_modules,
+        options.strict_duplicate_chunk_grouping,
+        options.split_duplicate_groups_by_package,
+      );
 
       chunk_mutation.remove_empty_chunks(compilation);
 

@@ -1162,6 +1162,8 @@ export interface RawBetterChunkOptions {
   keepNamedChunk?: boolean
   removeDuplicateModules?: boolean
   entryLikeChunks?: Array<string>
+  strictDuplicateChunkGrouping?: boolean
+  splitDuplicateGroupsByPackage?: boolean
   stages?: Array<RawStage>
   keepMagicChunks?: Array<string>
   concatSmallChunks?: boolean
