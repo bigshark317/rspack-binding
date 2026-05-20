@@ -1,0 +1,139 @@
+name: Build Binding Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "binding-v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: '["ubuntu-latest"]'
+          - target: aarch64-unknown-linux-gnu
+            runner: '["ubuntu-latest"]'
+          - target: x86_64-unknown-linux-musl
+            runner: '["ubuntu-latest"]'
+          - target: aarch64-unknown-linux-musl
+            runner: '["ubuntu-latest"]'
+          - target: i686-pc-windows-msvc
+            runner: '["windows-latest"]'
+          - target: x86_64-pc-windows-msvc
+            runner: '["windows-latest"]'
+          - target: aarch64-pc-windows-msvc
+            runner: '["windows-latest"]'
+          - target: x86_64-apple-darwin
+            runner: '["macos-13"]'
+          - target: aarch64-apple-darwin
+            runner: '["macos-14"]'
+
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      target: ${{ matrix.target }}
+      runner: ${{ matrix.runner }}
+      profile: release-prod
+      test: false
+
+  package:
+    name: Assemble Single Package
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download all binding artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble package directory
+        shell: bash
+        run: |
+          set -eux
+
+          rm -rf dist-binding
+          mkdir -p dist-binding
+
+          cp crates/node_binding/binding.js dist-binding/
+          cp crates/node_binding/binding.d.ts dist-binding/
+          cp LICENSE dist-binding/
+
+          if [ -f crates/node_binding/README.md ]; then
+            cp crates/node_binding/README.md dist-binding/README.md
+          else
+            cat > dist-binding/README.md <<'EOF'
+          # @byted-meego/rspack-binding
+
+          Prebuilt native bindings for rspack.
+          EOF
+          fi
+
+          find artifacts -name '*.node' -exec cp {} dist-binding/ \;
+
+          node <<'NODE'
+          const fs = require('fs');
+
+          const src = JSON.parse(
+            fs.readFileSync('crates/node_binding/package.json', 'utf8')
+          );
+
+          const pkg = {
+            name: '@byted-meego/rspack-binding',
+            version: src.version,
+            license: src.license,
+            description: src.description,
+            main: 'binding.js',
+            types: 'binding.d.ts',
+            homepage: src.homepage,
+            bugs: src.bugs,
+            repository: {
+              type: 'git',
+              url: 'git+https://github.com/bigshark317/rspack-binding.git'
+            },
+            publishConfig: {
+              access: 'public'
+            },
+            files: [
+              'binding.js',
+              'binding.d.ts',
+              '*.node',
+              'README.md',
+              'LICENSE'
+            ]
+          };
+
+          fs.writeFileSync(
+            'dist-binding/package.json',
+            JSON.stringify(pkg, null, 2)
+          );
+          NODE
+
+          ls -lah dist-binding
+
+      - name: Pack npm tarball
+        run: |
+          cd dist-binding
+          npm pack
+
+      - name: Upload assembled package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rspack-binding-package
+          path: dist-binding
+
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: rspack-binding-tgz
+          path: dist-binding/*.tgz
